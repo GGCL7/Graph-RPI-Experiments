@@ -16,12 +16,45 @@ The repository contains the following components:
 
 - **train_test data**: Stores the original benchmark RPI datasets used for training and testing.
 
-## 🔧 Installation Instructions
+## 🔧 Installation instructions
 
 1. **Clone the repository**
 ```bash
 git clone https://github.com/yourname/Graph-RPI-All-Experiments.git
 cd Graph-RPI-All-Experiments
+```
+2. **Set up the Python environment**
+```bash
+conda create -n graphrpi python=3.10
+conda activate graphrpi
+pip install -r requirements.txt
+```
+3. **Set up the Python environment**
+```bash
+conda create -n graphrpi python=3.10
+conda activate graphrpi
+pip install -r requirements.txt
+```
+4. **ESM-2 Language model embeddings**
+```bash
+https://huggingface.co/facebook/esm2_t6_8M_UR50D
+```
+
+## 🚀 Running the Graph-RPI Model
+To train the Graph-RPI model, navigate to the model folder and execute the main script:
+
+```bash
+cd Graph-RPI-Model
+python main.py
+```
+
+
+
+
+
+
+
+
 
 
 
