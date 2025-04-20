@@ -1,0 +1,608 @@
+
+import os
+import random
+import copy
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torch_geometric.data import Data
+import torch_geometric.transforms as T
+from torch_geometric.nn import Linear, GINConv, GATConv
+from torch_geometric.utils import degree, to_undirected
+from torch_sparse import SparseTensor
+from sklearn.metrics import roc_auc_score, average_precision_score
+import pandas as pd
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+
+
+def calculate_metrics(y_true, y_pred):
+    TP = TN = FP = FN = 0
+    for i in range(len(y_true)):
+        if y_true[i] == 1 and y_pred[i] == 1:
+            TP += 1
+        if y_true[i] == 0 and y_pred[i] == 0:
+            TN += 1
+        if y_true[i] == 0 and y_pred[i] == 1:
+            FP += 1
+        if y_true[i] == 1 and y_pred[i] == 0:
+            FN += 1
+    accuracy = (TP + TN) / (TP + TN + FP + FN + 1e-10)
+    sensitivity = TP / (TP + FN + 1e-10)
+    precision = TP / (TP + FP + 1e-10)
+    specificity = TN / (TN + FP + 1e-10)
+    mcc = (TP * TN - FP * FN) / np.sqrt((TP + FP) * (TP + FN) * (TN + FP) * (TN + FN) + 1e-10)
+    F1_score = 2 * (precision * sensitivity) / (precision + sensitivity + 1e-10)
+    return accuracy, sensitivity, precision, specificity, F1_score, mcc
+
+
+def ce_loss(pos_out, neg_out):
+    pos_loss = F.binary_cross_entropy(pos_out.sigmoid(), torch.ones_like(pos_out))
+    neg_loss = F.binary_cross_entropy(neg_out.sigmoid(), torch.zeros_like(neg_out))
+    return pos_loss + neg_loss
+
+
+
+class GNNEncoder(nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels, heads):
+        super(GNNEncoder, self).__init__()
+        self.convs = nn.ModuleList()
+        self.bns = nn.ModuleList()
+        self.convs.append(GATConv(in_channels, hidden_channels // heads, heads=heads))
+        self.convs.append(GINConv(Linear(hidden_channels, out_channels), train_eps=True))
+        self.bns.append(nn.BatchNorm1d(hidden_channels))
+        self.bns.append(nn.BatchNorm1d(out_channels))
+        self.dropout = nn.Dropout(0.5)
+        self.activation = nn.ELU()
+
+    def forward(self, x, edge_index):
+        edge_index = SparseTensor.from_edge_index(edge_index, sparse_sizes=(x.size(0), x.size(0)))
+        for conv, bn in zip(self.convs[:-1], self.bns[:-1]):
+            x = self.dropout(x)
+            x = conv(x, edge_index)
+            x = bn(x)
+            x = self.activation(x)
+        x = self.dropout(x)
+        x = self.convs[-1](x, edge_index)
+        x = self.bns[-1](x)
+        x = self.activation(x)
+        return x
+
+
+class EdgeDecoder(nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels):
+        super(EdgeDecoder, self).__init__()
+        self.mlps = nn.ModuleList([
+            nn.Linear(in_channels, hidden_channels),
+            nn.Linear(hidden_channels, out_channels)
+        ])
+        self.dropout = nn.Dropout(0.5)
+        self.activation = nn.ELU()
+
+    def forward(self, z, edge):
+        x = z[edge[0]] * z[edge[1]]
+        for mlp in self.mlps[:-1]:
+            x = self.dropout(x)
+            x = mlp(x)
+            x = self.activation(x)
+        x = self.mlps[-1](x)
+        return x
+
+
+class DegreeDecoder(nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels=1):
+        super(DegreeDecoder, self).__init__()
+        self.mlps = nn.ModuleList([
+            nn.Linear(in_channels, hidden_channels),
+            nn.Linear(hidden_channels, out_channels)
+        ])
+        self.dropout = nn.Dropout(0.5)
+        self.activation = nn.ELU()
+
+    def forward(self, x):
+        for mlp in self.mlps[:-1]:
+            x = mlp(x)
+            x = self.dropout(x)
+            x = self.activation(x)
+        x = self.mlps[-1](x)
+        x = self.activation(x)
+        return x
+
+
+class RPI(nn.Module):
+    def __init__(self, encoder, edge_decoder, degree_decoder, mask):
+        super(RPI, self).__init__()
+        self.encoder = encoder
+        self.edge_decoder = edge_decoder
+        self.degree_decoder = degree_decoder
+        self.mask = mask
+        self.loss_fn = ce_loss
+
+    def train_epoch(self, data, optimizer, alpha, batch_size=8192, grad_norm=1.0):
+        x, edge_index = data.x, data.edge_index
+        remaining_edges, masked_edges = self.mask(edge_index)
+        num_neg = masked_edges.size(1)
+        num_rna = data.num_rna
+        neg_edges = torch.stack([
+            torch.randint(0, num_rna, (num_neg,), device=edge_index.device),
+            torch.randint(num_rna, data.num_nodes, (num_neg,), device=edge_index.device)
+        ], dim=0)
+        for perm in DataLoader(range(masked_edges.size(1)), batch_size=batch_size, shuffle=True):
+            optimizer.zero_grad()
+            z = self.encoder(x, remaining_edges)
+            batch_masked_edges = masked_edges[:, perm]
+            batch_neg_edges = neg_edges[:, perm]
+            pos_out = self.edge_decoder(z, batch_masked_edges)
+            neg_out = self.edge_decoder(z, batch_neg_edges)
+            loss = self.loss_fn(pos_out, neg_out)
+            deg = degree(masked_edges[1].flatten(), data.num_nodes).float()
+            loss += alpha * F.mse_loss(self.degree_decoder(z).squeeze(), deg)
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.parameters(), grad_norm)
+            optimizer.step()
+
+    @torch.no_grad()
+    def batch_predict(self, z, edges, batch_size=2 ** 16):
+        preds = []
+        for perm in DataLoader(range(edges.size(1)), batch_size):
+            edge = edges[:, perm]
+            preds += [self.edge_decoder(z, edge).squeeze().cpu()]
+        pred = torch.cat(preds, dim=0)
+        return pred
+
+    @torch.no_grad()
+    def test(self, z, pos_edge_index, neg_edge_index):
+        pos_pred = self.batch_predict(z, pos_edge_index)
+        neg_pred = self.batch_predict(z, neg_edge_index)
+        pred = torch.cat([pos_pred, neg_pred], dim=0)
+        pos_y = pos_pred.new_ones(pos_pred.size(0))
+        neg_y = pos_pred.new_zeros(neg_pred.size(0))
+        y = torch.cat([pos_y, neg_y], dim=0)
+        y, pred = y.cpu().numpy(), pred.cpu().numpy()
+        auc = roc_auc_score(y, pred)
+        ap = average_precision_score(y, pred)
+        temp = torch.tensor(pred)
+        temp[temp >= 0.5] = 1
+        temp[temp < 0.5] = 0
+        acc, sen, pre, spe, F1, mcc = calculate_metrics(y, temp.cpu())
+        return auc, ap, acc, sen, pre, spe, F1, mcc
+
+
+
+def mask_edge(edge_index, p):
+    e_ids = torch.arange(edge_index.size(1), dtype=torch.long, device=edge_index.device)
+    mask = torch.full_like(e_ids, p, dtype=torch.float32)
+    mask = torch.bernoulli(mask).to(torch.bool)
+    return edge_index[:, ~mask], edge_index[:, mask]
+
+
+class Mask(nn.Module):
+    def __init__(self, p):
+        super(Mask, self).__init__()
+        self.p = p
+
+    def forward(self, edge_index):
+        remaining_edges, masked_edges = mask_edge(edge_index, p=self.p)
+        remaining_edges = to_undirected(remaining_edges)
+        return remaining_edges, masked_edges
+
+
+def filter_bipartite_negatives(neg_edge_index, num_rna):
+    mask = ((neg_edge_index[0] < num_rna) & (neg_edge_index[1] >= num_rna)) | \
+           ((neg_edge_index[0] >= num_rna) & (neg_edge_index[1] < num_rna))
+    return neg_edge_index[:, mask]
+
+
+def parse_ids(file_path):
+    ids = []
+    with open(file_path, 'r') as file:
+        for line in file:
+            if line.startswith('>'):
+                ids.append(line[1:].strip())
+    return ids
+
+
+def parse_pairs(file_path):
+    positive_pairs = []
+    negative_pairs = []
+    with open(file_path, 'r') as file:
+        for line in file:
+            fields = line.strip().split('\t')
+            if len(fields) == 2:
+                protein_id, rna_id = fields
+                positive_pairs.append((protein_id, rna_id))
+            elif len(fields) >= 3:
+                protein_id, rna_id, label = fields[:3]
+                if int(label) == 1:
+                    positive_pairs.append((protein_id, rna_id))
+                elif int(label) == 0:
+                    negative_pairs.append((protein_id, rna_id))
+    return positive_pairs, negative_pairs
+
+
+def parse_pairs_only(file_path):
+    pairs = []
+    with open(file_path, 'r') as file:
+        for line in file:
+            fields = line.strip().split('\t')
+            if len(fields) >= 2:
+                protein_id, rna_id = fields[:2]
+                pairs.append((protein_id, rna_id))
+    return pairs
+
+
+def read_protein_sequences_from_fasta(file_path):
+    sequences = []
+    sequence = ''
+    with open(file_path, 'r') as file:
+        for line in file:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('>'):
+                if sequence:
+                    sequences.append(sequence)
+                    sequence = ''
+            else:
+                sequence += line
+        if sequence:
+            sequences.append(sequence)
+    return sequences
+
+
+def generate_features_protein_bert(sequences, tokenizer, transformer_model):
+    features = []
+    for seq in sequences:
+        inputs = tokenizer(seq, return_tensors='pt')["input_ids"]
+        with torch.no_grad():
+            hidden_states = transformer_model(inputs)[0]
+        embedding_mean = torch.mean(hidden_states[0], dim=0)
+        features.append(embedding_mean)
+    features_np = np.vstack([feat.numpy() for feat in features])
+    print(f"Generated protein BERT features with shape: {features_np.shape}")
+    return features_np
+
+
+from predict_model.RNA_feature import generate_features_rna
+from predict_model.protein_feature import generate_features_protein
+
+
+
+def build_edge_index(pairs):
+    edge_list = []
+    for p, r in pairs:
+        if (p in protein_id_to_index) and (r in rna_id_to_index):
+            rna_idx = rna_id_to_index[r]
+            protein_idx = protein_id_to_index[p]
+            edge_list.append([rna_idx, protein_idx + len(rna_ids)])
+    if len(edge_list) == 0:
+        return torch.empty((2, 0), dtype=torch.long)
+    return torch.LongTensor(edge_list).t()
+
+
+def save_pairs(edge_label_index, file_path):
+    with open(file_path, 'w') as f:
+        for i in range(edge_label_index.size(1)):
+            idx1 = edge_label_index[0, i].item()
+            idx2 = edge_label_index[1, i].item()
+            if idx1 < len(rna_ids) and idx2 >= len(rna_ids):
+                rna_id = rna_ids[idx1]
+                protein_id = protein_ids[idx2 - len(rna_ids)]
+            elif idx2 < len(rna_ids) and idx1 >= len(rna_ids):
+                rna_id = rna_ids[idx2]
+                protein_id = protein_ids[idx1 - len(rna_ids)]
+            else:
+                continue
+            f.write(f"{protein_id}\t{rna_id}\n")
+
+
+
+def train_and_evaluate(model, train_data, test_data, optimizer, num_epochs=500, alpha=0.5):
+    best_acc = 0
+    best_state = None
+    best_metrics = None
+    for epoch in range(num_epochs):
+        model.train()
+        model.train_epoch(train_data, optimizer, alpha)
+        model.eval()
+        with torch.no_grad():
+            z = model.encoder(test_data.x, test_data.edge_index)
+            metrics = model.test(z, test_data.pos_edge_label_index, test_data.neg_edge_label_index)
+        if metrics[2] > best_acc:
+            best_acc = metrics[2]
+            best_state = copy.deepcopy(model.state_dict())
+            best_metrics = metrics
+        if (epoch + 1) % 100 == 0:
+            print(f"Epoch {epoch + 1:03d}: Test ACC={metrics[2]:.4f}")
+    return best_metrics, best_state
+
+
+
+if __name__ == '__main__':
+    # 设置路径（根据你的实际路径修改）
+    dataset_name = "RPImerged"
+    base_path = "Data"
+    data_path = os.path.join(base_path, dataset_name)
+    folds_path = os.path.join(data_path, "folds")
+    save_path = os.path.join(base_path, dataset_name)
+    os.makedirs(save_path, exist_ok=True)
+
+
+    protein_file = os.path.join(data_path, "Protein.txt")
+    rna_file = os.path.join(data_path, "RNA.txt")
+    pairs_file = os.path.join(data_path, "Pairs.txt")
+
+
+    protein_sequences = read_protein_sequences_from_fasta(protein_file)
+
+    rna_features = generate_features_rna(rna_file)
+    print(f"Generated RNA features with shape: {rna_features.shape}")
+
+    from transformers import AutoTokenizer, AutoModel
+
+    tokenizer = AutoTokenizer.from_pretrained("/Users/ggcl7/Desktop/ESM_Pre_model", trust_remote_code=True)
+    transformer_model = AutoModel.from_pretrained("/Users/ggcl7/Desktop/ESM_Pre_model", trust_remote_code=True)
+    protein_bert_features = generate_features_protein_bert(protein_sequences, tokenizer, transformer_model)
+
+    protein_new_features = generate_features_protein(protein_file)
+    print(f"Generated protein new features with shape: {protein_new_features.shape}")
+
+
+    output_dim = 909
+    RNA = rna_features
+    protein = np.hstack((protein_bert_features, protein_new_features))
+
+
+    protein_ids = parse_ids(protein_file)
+    rna_ids = parse_ids(rna_file)
+    protein_id_to_index = {pid: idx for idx, pid in enumerate(protein_ids)}
+    rna_id_to_index = {rid: idx for idx, rid in enumerate(rna_ids)}
+
+
+    rna_emb = []
+    for feat in RNA:
+        feat_list = feat.tolist()
+        feat_list += [0] * (output_dim - len(feat_list))
+        rna_emb.append(feat_list)
+    rna_emb = torch.Tensor(rna_emb)
+
+    protein_emb = []
+    for feat in protein:
+        feat_list = feat.tolist()
+        feat_list += [0] * (output_dim - len(feat_list))
+        protein_emb.append(feat_list)
+    protein_emb = torch.Tensor(protein_emb)
+
+    feature = torch.cat([rna_emb, protein_emb], dim=0)
+
+    full_positive_pairs, _ = parse_pairs(pairs_file)
+    relation_matrix = np.zeros((len(rna_ids), len(protein_ids)), dtype=int)
+    for protein_id, rna_id in full_positive_pairs:
+        if (protein_id in protein_id_to_index) and (rna_id in rna_id_to_index):
+            protein_index = protein_id_to_index[protein_id]
+            rna_index = rna_id_to_index[rna_id]
+            relation_matrix[rna_index, protein_index] = 1
+    pos_edge_index = []
+    for rna_index in range(len(rna_ids)):
+        for protein_index in range(len(protein_ids)):
+            if relation_matrix[rna_index, protein_index] == 1:
+                pos_edge_index.append([rna_index, protein_index + len(rna_ids)])
+    pos_edge_index = torch.LongTensor(pos_edge_index).t()
+
+    data_all = Data(x=feature, edge_index=pos_edge_index)
+    data_all.num_rna = len(rna_ids)
+
+    mask_probs = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    fixed_alpha = 0.5
+    results_mask = []
+    save_path_mask = os.path.join(save_path, "ablation_mask")
+    os.makedirs(save_path_mask, exist_ok=True)
+
+    num_folds = 5
+    for mask_prob in mask_probs:
+        print(f"\n===== 消融 mask_prob, 当前 mask_prob={mask_prob}, 固定 alpha={fixed_alpha} =====")
+        for fold in range(1, num_folds + 1):
+            print(f"\n--- Fold {fold} ---")
+            set_seed(2023 + fold)
+            # 正样本划分
+            test_fold_file = os.path.join(folds_path, f"fold{fold}_pairs.txt")
+            test_pos_pairs, _ = parse_pairs(test_fold_file)
+            test_pairs = test_pos_pairs
+            train_pairs = []
+            for i in range(1, num_folds + 1):
+                if i != fold:
+                    fold_file = os.path.join(folds_path, f"fold{i}_pairs.txt")
+                    train_pos_pairs, _ = parse_pairs(fold_file)
+                    train_pairs.extend(train_pos_pairs)
+
+            transform = T.RandomLinkSplit(
+                num_val=0,
+                num_test=0.2,
+                is_undirected=True,
+                split_labels=True,
+                add_negative_train_samples=True
+            )
+            train_data_rand, _, test_data_rand = transform(data_all)
+
+            train_data_rand.pos_edge_label_index = build_edge_index(train_pairs)
+            test_data_rand.pos_edge_label_index = build_edge_index(test_pairs)
+
+            train_data_rand.neg_edge_label_index = filter_bipartite_negatives(train_data_rand.neg_edge_label_index,
+                                                                              data_all.num_rna)
+            test_data_rand.neg_edge_label_index = filter_bipartite_negatives(test_data_rand.neg_edge_label_index,
+                                                                             data_all.num_rna)
+
+
+            train_neg_file = os.path.join(base_path, dataset_name, f"fold{fold}", "train", "negative_pairs.txt")
+            neg_pairs_train = parse_pairs_only(train_neg_file)
+            train_data_rand.neg_edge_label_index = build_edge_index(neg_pairs_train)
+            num_pos_train = train_data_rand.pos_edge_label_index.size(1)
+            train_neg = train_data_rand.neg_edge_label_index
+            if train_neg.size(1) < num_pos_train:
+                indices = torch.randint(0, train_neg.size(1), (num_pos_train,), device=train_neg.device)
+                train_data_rand.neg_edge_label_index = train_neg[:, indices]
+            elif train_neg.size(1) > num_pos_train:
+                indices = torch.randperm(train_neg.size(1))[:num_pos_train]
+                train_data_rand.neg_edge_label_index = train_neg[:, indices]
+
+            test_neg_file = os.path.join(base_path, dataset_name, f"fold{fold}", "test", "negative_pairs.txt")
+            neg_pairs_test = parse_pairs_only(test_neg_file)
+            test_data_rand.neg_edge_label_index = build_edge_index(neg_pairs_test)
+            num_pos_test = test_data_rand.pos_edge_label_index.size(1)
+            test_neg = test_data_rand.neg_edge_label_index
+            if test_neg.size(1) < num_pos_test:
+                indices = torch.randint(0, test_neg.size(1), (num_pos_test,), device=test_neg.device)
+                test_data_rand.neg_edge_label_index = test_neg[:, indices]
+            elif test_neg.size(1) > num_pos_test:
+                indices = torch.randperm(test_neg.size(1))[:num_pos_test]
+                test_data_rand.neg_edge_label_index = test_neg[:, indices]
+
+            train_data = train_data_rand
+            test_data = test_data_rand
+
+            encoder = GNNEncoder(in_channels=output_dim, hidden_channels=64, out_channels=128, heads=8)
+            edge_decoder = EdgeDecoder(in_channels=128, hidden_channels=64, out_channels=1)
+            degree_decoder = DegreeDecoder(in_channels=128, hidden_channels=64, out_channels=1)
+
+            mask_module = Mask(p=mask_prob)
+            model = RPI(encoder, edge_decoder, degree_decoder, mask_module)
+            optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=5e-5)
+
+
+            metrics, best_state = train_and_evaluate(model, train_data, test_data, optimizer, num_epochs=1000,
+                                                     alpha=fixed_alpha)
+            result_row = {
+                "Dataset": dataset_name,
+                "Fold": fold,
+                "Mask_Prob": mask_prob,
+                "Alpha": fixed_alpha,
+                "AUC": metrics[0],
+                "AP": metrics[1],
+                "ACC": metrics[2],
+                "SEN": metrics[3],
+                "PRE": metrics[4],
+                "SPE": metrics[5],
+                "F1": metrics[6],
+                "MCC": metrics[7]
+            }
+            results_mask.append(result_row)
+            print(
+                f"Fold {fold} [mask_prob={mask_prob}, alpha={fixed_alpha}]: ACC={metrics[2]:.4f}, AUC={metrics[0]:.4f}")
+
+
+    results_mask_df = pd.DataFrame(results_mask)
+    results_mask_csv = os.path.join(save_path, "ablation_mask_results_RPI369.csv")
+    results_mask_df.to_csv(results_mask_csv, index=False)
+    print(f"\n✅ 消融 mask_prob 实验的结果已保存到: {results_mask_csv}")
+
+    alpha_values = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1]
+    fixed_mask_prob = 0.4
+    results_alpha = []
+    save_path_alpha = os.path.join(save_path, "ablation_alpha")
+    os.makedirs(save_path_alpha, exist_ok=True)
+
+    for alpha in alpha_values:
+        print(f"\n===== 固定 mask_prob={fixed_mask_prob}, 消融 alpha, 当前 alpha={alpha} =====")
+        for fold in range(1, num_folds + 1):
+            print(f"\n--- Fold {fold} ---")
+            set_seed(2023 + fold)
+
+            test_fold_file = os.path.join(folds_path, f"fold{fold}_pairs.txt")
+            test_pos_pairs, _ = parse_pairs(test_fold_file)
+            test_pairs = test_pos_pairs
+            train_pairs = []
+            for i in range(1, num_folds + 1):
+                if i != fold:
+                    fold_file = os.path.join(folds_path, f"fold{i}_pairs.txt")
+                    train_pos_pairs, _ = parse_pairs(fold_file)
+                    train_pairs.extend(train_pos_pairs)
+
+
+            transform = T.RandomLinkSplit(
+                num_val=0,
+                num_test=0.2,
+                is_undirected=True,
+                split_labels=True,
+                add_negative_train_samples=True
+            )
+            train_data_rand, _, test_data_rand = transform(data_all)
+
+            train_data_rand.pos_edge_label_index = build_edge_index(train_pairs)
+            test_data_rand.pos_edge_label_index = build_edge_index(test_pairs)
+
+            train_data_rand.neg_edge_label_index = filter_bipartite_negatives(train_data_rand.neg_edge_label_index,
+                                                                              data_all.num_rna)
+            test_data_rand.neg_edge_label_index = filter_bipartite_negatives(test_data_rand.neg_edge_label_index,
+                                                                             data_all.num_rna)
+
+
+            train_neg_file = os.path.join(base_path, dataset_name, f"fold{fold}", "train", "negative_pairs.txt")
+            neg_pairs_train = parse_pairs_only(train_neg_file)
+            train_data_rand.neg_edge_label_index = build_edge_index(neg_pairs_train)
+            num_pos_train = train_data_rand.pos_edge_label_index.size(1)
+            train_neg = train_data_rand.neg_edge_label_index
+            if train_neg.size(1) < num_pos_train:
+                indices = torch.randint(0, train_neg.size(1), (num_pos_train,), device=train_neg.device)
+                train_data_rand.neg_edge_label_index = train_neg[:, indices]
+            elif train_neg.size(1) > num_pos_train:
+                indices = torch.randperm(train_neg.size(1))[:num_pos_train]
+                train_data_rand.neg_edge_label_index = train_neg[:, indices]
+
+            test_neg_file = os.path.join(base_path, dataset_name, f"fold{fold}", "test", "negative_pairs.txt")
+            neg_pairs_test = parse_pairs_only(test_neg_file)
+            test_data_rand.neg_edge_label_index = build_edge_index(neg_pairs_test)
+            num_pos_test = test_data_rand.pos_edge_label_index.size(1)
+            test_neg = test_data_rand.neg_edge_label_index
+            if test_neg.size(1) < num_pos_test:
+                indices = torch.randint(0, test_neg.size(1), (num_pos_test,), device=test_neg.device)
+                test_data_rand.neg_edge_label_index = test_neg[:, indices]
+            elif test_neg.size(1) > num_pos_test:
+                indices = torch.randperm(test_neg.size(1))[:num_pos_test]
+                test_data_rand.neg_edge_label_index = test_neg[:, indices]
+
+            train_data = train_data_rand
+            test_data = test_data_rand
+
+
+            encoder = GNNEncoder(in_channels=output_dim, hidden_channels=64, out_channels=128, heads=8)
+            edge_decoder = EdgeDecoder(in_channels=128, hidden_channels=64, out_channels=1)
+            degree_decoder = DegreeDecoder(in_channels=128, hidden_channels=64, out_channels=1)
+            mask_module = Mask(p=fixed_mask_prob)
+            model = RPI(encoder, edge_decoder, degree_decoder, mask_module)
+            optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=5e-5)
+
+
+            metrics, best_state = train_and_evaluate(model, train_data, test_data, optimizer, num_epochs=1000,
+                                                     alpha=alpha)
+            result_row = {
+                "Dataset": dataset_name,
+                "Fold": fold,
+                "Mask_Prob": fixed_mask_prob,
+                "Alpha": alpha,
+                "AUC": metrics[0],
+                "AP": metrics[1],
+                "ACC": metrics[2],
+                "SEN": metrics[3],
+                "PRE": metrics[4],
+                "SPE": metrics[5],
+                "F1": metrics[6],
+                "MCC": metrics[7]
+            }
+            results_alpha.append(result_row)
+            print(
+                f"Fold {fold} [mask_prob={fixed_mask_prob}, alpha={alpha}]: ACC={metrics[2]:.4f}, AUC={metrics[0]:.4f}")
+
+
+    results_alpha_df = pd.DataFrame(results_alpha)
+    results_alpha_csv = os.path.join(save_path, "ablation_alpha_results_RPI369.csv")
+    results_alpha_df.to_csv(results_alpha_csv, index=False)
+    print(f"\n✅ 消融 alpha 实验的结果已保存到: {results_alpha_csv}")
