@@ -20,8 +20,8 @@ The repository contains the following components:
 
 1. **Clone the repository**
 ```bash
-git clone https://github.com/yourname/Graph-RPI-All-Experiments.git
-cd Graph-RPI-All-Experiments
+git clone https://github.com/yourname/Graph-RPI-Experiments.git
+cd Graph-RPI-Experiments
 ```
 2. **Set up the Python environment**
 ```bash
